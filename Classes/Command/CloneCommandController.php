@@ -17,7 +17,6 @@ use Symfony\Component\Yaml\Yaml;
  */
 class CloneCommandController extends AbstractCommandController
 {
-
     /**
      * @Flow\Inject
      * @var Bootstrap
@@ -81,8 +80,9 @@ class CloneCommandController extends AbstractCommandController
      * @param string $presetName name of the preset from the settings
      * @param boolean $yes confirm execution without further input
      * @param boolean $keepDb skip dropping of database during sync
+     * @param string $only Only execute the given command (comma separated) - commands available: database, resources, translations
      */
-    public function presetCommand($presetName, $yes = false, $keepDb = false)
+    public function presetCommand($presetName, $yes = false, $keepDb = false, $only = false)
     {
         if (count($this->clonePresets) > 0) {
             if ($this->clonePresets && array_key_exists($presetName, $this->clonePresets)) {
@@ -107,7 +107,8 @@ class CloneCommandController extends AbstractCommandController
                     ),
                     (isset($configuration['sshOptions']) ?
                         $configuration['sshOptions'] : ''
-                    )
+                    ),
+                    $only
                 );
             } else {
                 $this->renderLine('The preset ' . $presetName . ' was not found!');
@@ -132,6 +133,7 @@ class CloneCommandController extends AbstractCommandController
      * @param boolean $keepDb skip dropping of database during sync
      * @param string $remoteFlowCommand the flow command to execute on the remote system
      * @param string $sshOptions additional options for the ssh command
+     * @param string $only Only execute the given command (comma separated) - commands available: database, resources, translations
      */
     protected function cloneRemoteHost(
         $host,
@@ -143,7 +145,8 @@ class CloneCommandController extends AbstractCommandController
         $yes = false,
         $keepDb = false,
         $remoteFlowCommand = null,
-        $sshOptions = ''
+        $sshOptions = '',
+        $only = false
     )
     {
         // fallback
@@ -151,51 +154,7 @@ class CloneCommandController extends AbstractCommandController
             $remoteFlowCommand = $this->flowCommand;
         }
 
-        // read local configuration
-        $this->renderHeadLine('Read local configuration');
-
-        $localDataPersistentPath = FLOW_PATH_ROOT . 'Data/Persistent';
-
-        // read remote configuration
-        $this->renderHeadLine('Fetch remote configuration');
-        $remotePersistenceConfigurationYaml = $this->executeLocalShellCommand(
-            'ssh -p %s %s %s@%s "cd %s; FLOW_CONTEXT=%s '
-            . $remoteFlowCommand
-            . ' configuration:show --type Settings --path Neos.Flow.persistence.backendOptions;"',
-            [
-                $port,
-                $sshOptions,
-                $user,
-                $host,
-                $path,
-                $context
-            ],
-            [
-                self::HIDE_RESULT
-            ]
-        );
-
-        if ($remotePersistenceConfigurationYaml) {
-            $remotePersistenceConfiguration = \Symfony\Component\Yaml\Yaml::parse($remotePersistenceConfigurationYaml);
-        }
-        $remoteDataPersistentPath = $path . '/Data/Persistent';
-
-        #################
-        # Are you sure? #
-        #################
-
-        if (!$yes) {
-            $this->renderLine("Are you sure you want to do this?  Type 'yes' to continue: ");
-            $handle = fopen("php://stdin", "r");
-            $line = fgets($handle);
-            if (trim($line) != 'yes') {
-                $this->renderLine('exit');
-                $this->quit(1);
-            } else {
-                $this->renderLine();
-                $this->renderLine();
-            }
-        }
+        $onlyCommandNames = Arrays::trimExplode(',', ($only === null ? '' : $only));
 
         ######################
         # Measure Start Time #
@@ -203,6 +162,109 @@ class CloneCommandController extends AbstractCommandController
 
         $startTimestamp = time();
 
+        if ($only === false || in_array('database', $onlyCommandNames)) {
+            // read local configuration
+            $this->renderHeadLine('Read local configuration');
+
+            // read remote configuration
+            $this->renderHeadLine('Fetch remote configuration');
+            $remotePersistenceConfigurationYaml = $this->executeLocalShellCommand(
+                'ssh -p %s %s %s@%s "cd %s; FLOW_CONTEXT=%s '
+                . $remoteFlowCommand
+                . ' configuration:show --type Settings --path Neos.Flow.persistence.backendOptions;"',
+                [
+                    $port,
+                    $sshOptions,
+                    $user,
+                    $host,
+                    $path,
+                    $context
+                ],
+                [
+                    self::HIDE_RESULT
+                ]
+            );
+
+            if ($remotePersistenceConfigurationYaml) {
+                $remotePersistenceConfiguration = \Symfony\Component\Yaml\Yaml::parse($remotePersistenceConfigurationYaml);
+            }
+
+            #################
+            # Are you sure? #
+            #################
+
+            if (!$yes) {
+                $this->renderLine("Are you sure you want to do this?  Type 'yes' to continue: ");
+                $handle = fopen("php://stdin", "r");
+                $line = fgets($handle);
+                if (trim($line) != 'yes') {
+                    $this->renderLine('exit');
+                    $this->quit(1);
+                } else {
+                    $this->renderLine();
+                    $this->renderLine();
+                }
+            }
+
+            #######################
+            # Check Configuration #
+            #######################
+            $this->checkConfiguration($remotePersistenceConfiguration);
+            $this->cloneDatabase($remotePersistenceConfiguration, $port, $sshOptions, $user, $host, $keepDb);
+        }
+
+        if ($only === false || in_array('resources', $onlyCommandNames)) {
+            $this->cloneResources($path, $port, $sshOptions, $user, $host);
+        }
+
+        if ($only === false || in_array('translations', $onlyCommandNames)) {
+            $this->cloneTranslations($path, $port, $sshOptions, $user, $host);
+        }
+
+        ################
+        # Clear Caches #
+        ################
+
+        $this->renderHeadLine('Clear caches');
+        $this->executeLocalFlowCommand('flow:cache:flush');
+
+        ##############
+        # Post Clone #
+        ##############
+
+        if ($postClone) {
+            $this->renderHeadLine('Execute post_clone commands');
+            if (is_array($postClone)) {
+                foreach ($postClone as $postCloneCommand) {
+                    $this->executeLocalShellCommandWithFlowContext($postCloneCommand);
+                }
+            } else {
+                $this->executeLocalShellCommandWithFlowContext($postClone);
+            }
+        }
+
+        #################
+        # Final Message #
+        #################
+
+        $endTimestamp = time();
+        $duration = $endTimestamp - $startTimestamp;
+
+        $this->renderHeadLine('Done');
+        $this->renderLine('Successfully cloned in %s seconds', [$duration]);
+    }
+
+
+    /**
+     * @param array $remotePersistenceConfiguration
+     * @param string $port ssh port
+     * @param string $sshOptions additional options for the ssh command
+     * @param string $user ssh user
+     * @param string $host ssh host
+     * @param bool $keepDb
+     */
+    protected function cloneDatabase($remotePersistenceConfiguration, $port, $sshOptions, $user, $host, $keepDb)
+    {
         ##################
         # Define Secrets #
         ##################
@@ -211,12 +273,6 @@ class CloneCommandController extends AbstractCommandController
         $this->addSecret($this->databaseConfiguration['password']);
         $this->addSecret($remotePersistenceConfiguration['user']);
         $this->addSecret($remotePersistenceConfiguration['password']);
-
-        #######################
-        # Check Configuration #
-        #######################
-
-        $this->checkConfiguration($remotePersistenceConfiguration);
 
         ################################################
         # Fallback to default MySQL port if not given. #
@@ -235,7 +291,7 @@ class CloneCommandController extends AbstractCommandController
         ########################
 
         if ($keepDb == false) {
-            $this->renderHeadLine('Drop and Recreate DB');
+            $this->renderHeadLine('Drop and recreate DB');
 
             $emptyLocalDbSql = $this->dbal->flushDbSql($this->databaseConfiguration['driver'], $this->databaseConfiguration['dbname']);
 
@@ -254,14 +310,14 @@ class CloneCommandController extends AbstractCommandController
                 ]
             );
         } else {
-            $this->renderHeadLine('Skipped (Drop and Recreate DB)');
+            $this->renderHeadLine('Skipped (drop and recreate DB)');
         }
 
         ######################
         #  Transfer Database #
         ######################
 
-        $this->renderHeadLine('Transfer Database');
+        $this->renderHeadLine('Transfer database');
         $this->executeLocalShellCommand(
             'ssh -p %s %s %s@%s -- %s | %s',
             [
@@ -289,13 +345,37 @@ class CloneCommandController extends AbstractCommandController
         );
 
         ##################
-        # Transfer Files #
+        # Set DB charset #
         ##################
+        if ($this->databaseConfiguration['driver'] == 'pdo_mysql' && $remotePersistenceConfiguration['charset'] != 'utf8mb4' ) {
+            $this->renderHeadLine('Set DB charset');
+            $this->executeLocalFlowCommand('database:setcharset');
+        }
+
+        ##############
+        # Migrate DB #
+        ##############
+
+        $this->renderHeadLine('Migrate cloned DB');
+        $this->executeLocalFlowCommand('doctrine:migrate');
+    }
+
+    /**
+     * @param string $path path on the remote server
+     * @param string $port ssh port
+     * @param string $sshOptions additional options for the ssh command
+     * @param string $user ssh user
+     * @param string $host ssh host
+     */
+    protected function cloneResources($path, $port, $sshOptions, $user, $host)
+    {
+        $remoteDataPersistentPath = $path . '/Data/Persistent';
+        $localDataPersistentPath = FLOW_PATH_ROOT . 'Data/Persistent';
 
         $resourceProxyConfiguration = $this->configurationService->getCurrentConfigurationByPath('resourceProxy');
 
         if (!$resourceProxyConfiguration) {
-            $this->renderHeadLine('Transfer Files');
+            $this->renderHeadLine('Transfer files');
             $this->executeLocalShellCommand(
                 'rsync -e "ssh -p %s %s" -kLr %s@%s:%s/* %s',
                 [
@@ -308,7 +388,7 @@ class CloneCommandController extends AbstractCommandController
                 ]
             );
         } else {
-            $this->renderHeadLine('Transfer Files - without Resources because a resourceProxyConfiguration is found');
+            $this->renderHeadLine('Transfer files - without resources because a resourceProxyConfiguration is found');
             $this->executeLocalShellCommand(
                 'rsync -e "ssh -p %s %s" --exclude "Resources/*" -kLr %s@%s:%s/* %s',
                 [
@@ -322,11 +402,24 @@ class CloneCommandController extends AbstractCommandController
             );
         }
 
-        #########################
-        # Transfer Translations #
-        #########################
+        #####################
+        # Publish Resources #
+        #####################
 
-        $this->renderHeadLine('Transfer Translations');
+        $this->renderHeadLine('Publish resources');
+        $this->executeLocalFlowCommand('resource:publish');
+    }
+
+    /**
+     * @param string $path path on the remote server
+     * @param string $port ssh port
+     * @param string $sshOptions additional options for the ssh command
+     * @param string $user ssh user
+     * @param string $host ssh host
+     */
+    protected function cloneTranslations($path, $port, $sshOptions, $user, $host)
+    {
+        $this->renderHeadLine('Transfer translations');
 
         $remoteDataTranslationsPath = $path . '/Data/Translations';
         $localDataTranslationsPath = FLOW_PATH_ROOT . 'Data/Translations';
@@ -356,71 +449,20 @@ class CloneCommandController extends AbstractCommandController
                     $localDataTranslationsPath
                 ]
             );
+
+            $this->renderLine('Translations successfully transferred');
+        } else {
+            $this->renderLine('No transfer of translation files necessary');
         }
-
-        ################
-        # Clear Caches #
-        ################
-
-        $this->renderHeadLine('Clear Caches');
-        $this->executeLocalFlowCommand('flow:cache:flush');
-
-        ##################
-        # Set DB charset #
-        ##################
-        if ($this->databaseConfiguration['driver'] == 'pdo_mysql' && $remotePersistenceConfiguration['charset'] != 'utf8mb4' ) {
-            $this->renderHeadLine('Set DB charset');
-            $this->executeLocalFlowCommand('database:setcharset');
-        }
-
-        ##############
-        # Migrate DB #
-        ##############
-
-        $this->renderHeadLine('Migrate cloned DB');
-        $this->executeLocalFlowCommand('doctrine:migrate');
-
-        #####################
-        # Publish Resources #
-        #####################
-
-        $this->renderHeadLine('Publish Resources');
-        $this->executeLocalFlowCommand('resource:publish');
-
-        ##############
-        # Post Clone #
-        ##############
-
-        if ($postClone) {
-            $this->renderHeadLine('Execute post_clone commands');
-            if (is_array($postClone)) {
-                foreach ($postClone as $postCloneCommand) {
-                    $this->executeLocalShellCommandWithFlowContext($postCloneCommand);
-                }
-            } else {
-                $this->executeLocalShellCommandWithFlowContext($postClone);
-            }
-        }
-
-        #################
-        # Final Message #
-        #################
-
-        $endTimestamp = time();
-        $duration = $endTimestamp - $startTimestamp;
-
-        $this->renderHeadLine('Done');
-        $this->renderLine('Successfully cloned in %s seconds', [$duration]);
     }
 
     /**
-     * @param $remotePersistenceConfiguration
-     * @param $this ->databaseConfiguration
+     * @param array $remotePersistenceConfiguration
      * @throws \Neos\Flow\Mvc\Exception\StopActionException
      */
     protected function checkConfiguration($remotePersistenceConfiguration)
     {
-        $this->renderHeadLine('Check Configuration');
+        $this->renderHeadLine('Check configuration');
         if (!$this->dbal->driverIsSupported($remotePersistenceConfiguration['driver'])
             && !$this->dbal->driverIsSupported($this->databaseConfiguration['driver'])) {
             $this->renderLine(sprintf('<error>ERROR:</error> Only pdo_pgsql and pdo_mysql drivers are supported! Remote: "%s" Local: "%s" configured.', $remotePersistenceConfiguration['driver'], $this->databaseConfiguration['driver']));
